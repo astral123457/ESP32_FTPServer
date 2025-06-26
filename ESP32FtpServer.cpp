@@ -1,33 +1,3 @@
-/*
- * FTP Server for ESP32
- * 
- * based on FTP Serveur for Arduino Due and Ethernet shield (W5100) or WIZ820io (W5200)
- * based on Jean-Michel Gallego's work
- * modified to work with esp8266 SPIFFS by David Paiva david@nailbuster.com
- * 
- * Modified by Ed Williams to support active or passive modes. No wildcards are supported. 
- *   Works with Windows FTP, UNIX FTP, WinSCP, Classic FTP and Firefox FTP clients that I 
- *   have access to. It's definitely not complete but works well enough for me.
- * 
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- * 
- * 2017: modified by @robo8080
- * 2019: modified by @fa1ke5
- * 2020-01-01: Modified by @mtnbkr88 (Ed Williams)
- * 
- */
-
 #include "ESP32FtpServer.h"
 
 #include <WiFi.h>
@@ -35,16 +5,23 @@
 #include "SD_MMC.h"
 
 #include <string.h> 
+
+#define FTP_DATA_PORT_PASV 50009
+#define FTP_DATA_PORT      20  // Adicione esta linha se estiver faltando
+
+
 using namespace std; 
 
 WiFiServer ftpServer( FTP_CTRL_PORT );
 WiFiServer dataServer( FTP_DATA_PORT );
 
-void FtpServer::begin(String uname, String pword)
+void FtpServer::begin(String uname, String pword, FS* fs, FileSystemType fsType)
 {
   // Tells the ftp server to begin listening for incoming connection
   _FTP_USER = uname;
   _FTP_PASS = pword;
+  fileSystem = fs;
+  _fsType = fsType;
 
   // Default for data port
   dataPort = FTP_DATA_PORT;
@@ -53,6 +30,7 @@ void FtpServer::begin(String uname, String pword)
   delay(10);
   dataServer.begin( FTP_DATA_PORT ); 
   delay(10);
+  setTimeout(5); // padrão 5 minutos
   millisTimeOut = (uint32_t)FTP_TIME_OUT * 60 * 1000;
   millisDelay = 0;
   cmdStatus = 0;
@@ -62,7 +40,7 @@ void FtpServer::begin(String uname, String pword)
 void FtpServer::iniVariables()
 {
   // Default Data connection is Active
-  dataPassiveConn = false;
+  dataPassiveConn = true;
   
   // Set the root directory
   strcpy( cwdName, "/" );
@@ -71,6 +49,33 @@ void FtpServer::iniVariables()
   transferStatus = 0;
   
 }
+//aaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+
+void FtpServer::setTimeout(uint32_t minutes) {
+  millisTimeOut = minutes * 60 * 1000UL;
+}
+
+void FtpServer::onUpload(std::function<void(const String&)> callback) {
+  uploadCallback = callback;
+}
+
+void FtpServer::onDownload(std::function<void(const String&)> callback) {
+  downloadCallback = callback;
+}
+
+void FtpServer::addCustomCommand(const String& cmd, std::function<void(const String&)> handler) {
+  customCommands[cmd] = handler;
+}
+
+void FtpServer::debugStatus() {
+  Serial.println("=== FTP DEBUG STATUS ===");
+  Serial.printf("User: %s | FS Type: %d\n", _FTP_USER.c_str(), _fsType);
+  Serial.printf("Client IP: %s | Connected: %s\n", client.remoteIP().toString().c_str(), client.connected() ? "yes" : "no");
+  Serial.printf("Current Dir: %s | Command: %s\n", cwdName, command);
+  Serial.println("=========================");
+}
+//aaaaaaaaaaaaaaaaaaaaaaaaa
 
 void FtpServer::handleFTP()
 {
@@ -433,64 +438,56 @@ boolean FtpServer::processCommand()
   //
   //  LIST - List 
   //
-  else if( ! strcmp( command, "LIST" ))
-    {
-    if(dataConnect()){
+  else if (!strcmp(command, "LIST")) {
+  if (dataConnect()) {
+    char path[FTP_CWD_SIZE] = "";
+    char buffer[256] = "";
 
-      char path[ FTP_CWD_SIZE ] = "";
-      char buffer[256] = "";
-      
-      if ( ! makePath( path )) {
-        client.print( "550 File/Directory " +String(parameters)+ " not found\r\n");
-      }
-      else {
-        File dir = SD_MMC.open(path);
-        if ( !dir ) 
-          client.print( "550 Can't open " + String(path) + "\r\n" );
-        else {
-          uint16_t nm = 0;
-          if (dir.isDirectory()) { // process a directory listing 
-            client.print( "150 Here comes the directory listing\r\n");
-            File file = dir.openNextFile();
-            while( file == 1) {
-              if ( formatLIST ( &file, buffer ) ) {
-                data.print( String(buffer) + "\r\n" );
-                #ifdef FTP_DEBUG
-                  Serial.println( String(buffer) );
-                #endif      
-                nm ++;
-              }
-              file = dir.openNextFile();
-              if (file < 1 ) {
-                break;
-              }
-            }
-            client.print( "226 Directory send OK.\r\n");
-            Serial.println( "226 " + String(nm) + " matches total");
-            }
-          else { // process a file listing
-            client.print( "150 Here comes the file listing\r\n");
-            if ( formatLIST ( &dir, buffer ) ) {
-              data.print( String(buffer) + "\r\n" );
+    if (!makePath(path)) {
+      client.print("550 File/Directory " + String(parameters) + " not found\r\n");
+    } else {
+      File dir = fileSystem->open(path); // corrigido!
+      if (!dir) {
+        client.print("550 Can't open " + String(path) + "\r\n");
+      } else {
+        uint16_t nm = 0;
+        if (dir.isDirectory()) {
+          client.print("150 Here comes the directory listing\r\n");
+
+          File file;
+          while ((file = dir.openNextFile())) {
+            if (formatLIST(&file, buffer)) {
+              data.print(String(buffer) + "\r\n");
               #ifdef FTP_DEBUG
-                Serial.println( String(buffer) );
-              #endif      
-              nm ++;
-              client.print( "226 File send OK.\r\n");
-              Serial.println( "226 " + String(nm) + " matches total");
+                Serial.println(String(buffer));
+              #endif
+              nm++;
             }
-            else {
-              client.print( "550 Can't open " + String(path) + "\r\n" );
-            }
+            file.close();
+          }
+
+          client.print("226 Directory send OK.\r\n");
+          Serial.println("226 " + String(nm) + " matches total");
+        } else {
+          client.print("150 Here comes the file listing\r\n");
+          if (formatLIST(&dir, buffer)) {
+            data.print(String(buffer) + "\r\n");
+            #ifdef FTP_DEBUG
+              Serial.println(String(buffer));
+            #endif
+            client.print("226 File send OK.\r\n");
+          } else {
+            client.print("550 Can't open " + String(path) + "\r\n");
           }
         }
+        dir.close();
       }
-      data.stop();
     }
-    else {
-      client.print( "425 No data connection\r\n");
-    }
+    data.stop();
+  } else {
+    client.print("425 No data connection\r\n");
   }
+}
     
   //
   //  MLSD - Listing for Machine Processing (see RFC 3659)
@@ -1174,40 +1171,28 @@ bool FtpServer::makeExistsPath( char * path, char * param )
   return false;
 }
 
-boolean FtpServer::formatLIST( File * file, char * buffer )
-{
-          String fn, fs;
-          fn = file->name();
-          int i = fn.lastIndexOf("/")+1;
-          fn.remove(0, i);
+boolean FtpServer::formatLIST(File* file, char* buffer) {
+  String fn = file->name();
+  int i = fn.lastIndexOf('/') + 1;
+  fn = fn.substring(i); // remove o caminho
 
-          char ft[21];
-          char fsbuf[20];
-          char fnbuf[200];
-          time_t ftime = file->getLastWrite();
-          strftime(ft, sizeof(ft), "%m-%d-%Y  %I:%M%p", localtime(&ftime));
+  char fnbuf[128];
+  fn.toCharArray(fnbuf, sizeof(fnbuf));
 
-          fs = String(file->size());
-          fs.toCharArray(fsbuf, sizeof(fsbuf));
-          fn.toCharArray(fnbuf, sizeof(fnbuf));
+  time_t ftime = file->getLastWrite();
+  struct tm* tm = localtime(&ftime);
 
-          /*
-          // insert commas in file size string
-          int insertPosition = fs.length() - 3;
-          while (insertPosition > 0) {
-            fs = fs.substring(0,insertPosition) + "," + fs.substring(insertPosition);
-            insertPosition-=3;
-          }
-          */
-          if(file->isDirectory()) {
-            if ( ! strcmp( file->name(), "/System Volume Information" ) ) // always skip this folder
-              return false;
-            sprintf(buffer, "%s <DIR> %s", ft, fnbuf);
-            }
-          else {
-            sprintf(buffer, "%s %s %s", ft, fsbuf, fnbuf);
-          }
-          return true;
+  char timebuf[20];
+  strftime(timebuf, sizeof(timebuf), "%b %d %H:%M", tm);  // Ex: "Jan 01 13:37"
+
+  if (file->isDirectory()) {
+    sprintf(buffer, "drwxr-xr-x 1 user group %8d %s %s", 0, timebuf, fnbuf);
+  } else {
+    sprintf(buffer, "-rw-r--r-- 1 user group %8u %s %s",
+            (unsigned int)file->size(), timebuf, fnbuf);
+  }
+
+  return true;
 }
 
 boolean FtpServer::formatMLST( File * file, char * buffer )
